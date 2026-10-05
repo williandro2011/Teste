@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Omni Realism Engine v9.9 - Raymarched Labirinto 3D & Física Newtoniana</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body, html { width: 100%; height: 100%; overflow: hidden; background: #000; font-family: monospace; }
+    canvas { display: block; width: 100vw; height: 100vh; }
+    #hud {
+      position: absolute; top: 12px; left: 12px; color: #00ffcc;
+      font-size: 11px; text-shadow: 0 0 5px #00ffcc; pointer-events: none;
+      background: rgba(0, 0, 0, 0.6); padding: 10px; border: 1px solid #00ffcc33;
+    }
+  </style>
+</head>
+<body>
+  <div id="hud">
+    [OMNI_REALISM_ENGINE_v9.9]<br>
+    FPS: <span id="fps">0</span><br>
+    VELOCIDADE: <span id="vel">0.00</span> m/s<br>
+    ARRASTO AERODINÂMICO (Fd): <span id="fd">0.00</span> N<br>
+    LUZ INTENSIDADE (InvSquare): <span id="light">1.00</span><br>
+    PARTÍCULAS ATIVAS: <span id="parts">0</span>
+  </div>
+  <canvas id="stage"></canvas>
+
+<script>
+// ============================================================================
+// 1. VETORES 3D & ÁLGEBRA MATRICIAL BRUTA
+// ============================================================================
+class Vec3 {
+  constructor(x=0, y=0, z=0) { this.x = x; this.y = y; this.z = z; }
+  set(x,y,z) { this.x = x; this.y = y; this.z = z; return this; }
+  add(v) { return new Vec3(this.x + v.x, this.y + v.y, this.z + v.z); }
+  sub(v) { return new Vec3(this.x - v.x, this.y - v.y, this.z - v.z); }
+  scale(s) { return new Vec3(this.x * s, this.y * s, this.z * s); }
+  dot(v) { return this.x * v.x + this.y * v.y + this.z * v.z; }
+  cross(v) { return new Vec3(this.y*v.z - this.z*v.y, this.z*v.x - this.x*v.z, this.x*v.y - this.y*v.x); }
+  lengthSq() { return this.x*this.x + this.y*this.y + this.z*this.z; }
+  length() { return Math.sqrt(this.lengthSq()); }
+  normalize() { const l = this.length(); return l > 0 ? this.scale(1/l) : new Vec3(); }
+}
+
+// ============================================================================
+// 2. CONFIGURAÇÕES FÍSICAS REAIS & CONSTANTES DE FLUIDOS/ARRASTO
+// ============================================================================
+const PHYS = {
+  rho: 1.225,       // Densidade do ar (kg/m^3)
+  Cd: 0.47,         // Coeficiente de arrasto esférico
+  A: 0.25,          // Área frontal (m^2)
+  mu_s: 0.6,        // Atrito estático
+  mu_d: 0.4,        // Atrito dinâmico
+  g: 9.81,          // Gravidade
+  restitution: 0.75 // Coeficiente de restituição (colisão inelástica)
+};
+
+// Mapa do Labirinto (1 = Parede, 0 = Espaço Livre)
+const MAP_SIZE = 8;
+const MAP = [
+  1,1,1,1,1,1,1,1,
+  1,0,0,0,1,0,0,1,
+  1,0,1,0,1,0,1,1,
+  1,0,1,0,0,0,0,1,
+  1,0,1,1,1,1,0,1,
+  1,0,0,0,0,1,0,1,
+  1,1,1,0,0,0,0,1,
+  1,1,1,1,1,1,1,1
+];
+
+// ============================================================================
+// 3. ESTADO DA CÂMERA / JOGADOR & PARTÍCULAS BROWNIANAS
+// ============================================================================
+const player = {
+  pos: new Vec3(1.5, 0.5, 1.5),
+  vel: new Vec3(0, 0, 0),
+  rotY: 0,
+  radius: 0.25,
+  mass: 70.0 // kg
+};
+
+class Particle {
+  constructor(pos, vel, life, color) {
+    this.pos = pos;
+    this.vel = vel;
+    this.life = life;
+    this.maxLife = life;
+    this.color = color;
+  }
+  update(dt) {
+    // Movimento Browniano (ruído aleatório térmico) + Arrasto
+    const brownian = new Vec3((Math.random()-0.5)*2, (Math.random()-0.5)*2, (Math.random()-0.5)*2).scale(0.8);
+    this.vel = this.vel.add(brownian.scale(dt));
+    this.pos = this.pos.add(this.vel.scale(dt));
+    this.life -= dt;
+  }
+}
+
+let particles = [];
+
+// ============================================================================
+// 4. MOTOR RAYMARCHING (SDFs, SOFT SHADOWS, AO, LIGHT DECAY)
+// ============================================================================
+function sdBox(p, b) {
+  const q = new Vec3(Math.abs(p.x) - b.x, Math.abs(p.y) - b.y, Math.abs(p.z) - b.z);
+  const maxQ = new Vec3(Math.max(q.x, 0), Math.max(q.y, 0), Math.max(q.z, 0));
+  return maxQ.length() + Math.min(Math.max(q.x, Math.max(q.y, q.z)), 0);
+}
+
+function mapSDF(p) {
+  // Limites do labirinto
+  const cellX = Math.floor(p.x);
+  const cellZ = Math.floor(p.z);
+  
+  let d = 1000.0;
+  
+  // Chão e Teto
+  d = Math.min(d, p.y);
+  d = Math.min(d, 2.0 - p.y);
+
+  // Checagem de blocos do mapa em vizinhança
+  for (let x = -1; x <= 1; x++) {
+    for (let z = -1; z <= 1; z++) {
+      const cx = cellX + x;
+      const cz = cellZ + z;
+      if (cx >= 0 && cx < MAP_SIZE && cz >= 0 && cz < MAP_SIZE) {
+        if (MAP[cz * MAP_SIZE + cx] === 1) {
+          const center = new Vec3(cx + 0.5, 1.0, cz + 0.5);
+          const boxD = sdBox(p.sub(center), new Vec3(0.5, 1.0, 0.5));
+          d = Math.min(d, boxD);
+        }
+      } else {
+        // Paredes externas absolutas
+        const center = new Vec3(cx + 0.5, 1.0, cz + 0.5);
+        d = Math.min(d, sdBox(p.sub(center), new Vec3(0.5, 1.0, 0.5)));
+      }
+    }
+  }
+  return d;
+}
+
+function calcNormal(p) {
+  const eps = 0.001;
+  const d = mapSDF(p);
+  const nx = mapSDF(new Vec3(p.x + eps, p.y, p.z)) - d;
+  const ny = mapSDF(new Vec3(p.x, p.y + eps, p.z)) - d;
+  const nz = mapSDF(new Vec3(p.x, p.y, p.z + eps)) - d;
+  return new Vec3(nx, ny, nz).normalize();
+}
+
+function calcAO(pos, nor) {
+  let occ = 0.0;
+  let sca = 1.0;
+  for (let i = 0; i < 5; i++) {
+    const hr = 0.01 + 0.12 * i / 4.0;
+    const aopos = nor.scale(hr).add(pos);
+    const dd = mapSDF(aopos);
+    occ += (hr - dd) * sca;
+    sca *= 0.95;
+  }
+  return Math.max(0.0, Math.min(1.0, 1.0 - 3.0 * occ));
+}
+
+function softShadow(ro, rd, mint, maxt, k) {
+  let res = 1.0;
+  let t = mint;
+  for (let i = 0; i < 16; i++) {
+    const h = mapSDF(ro.add(rd.scale(t)));
+    if (h < 0.001) return 0.0;
+    res = Math.min(res, k * h / t);
+    t += Math.max(0.02, h);
+    if (t >= maxt) break;
+  }
+  return Math.max(0.0, Math.min(1.0, res));
+}
+
+// ============================================================================
+// 5. ENGINE CANVAS 2D & RENDER LOOP DE ALTA FIDELIDADE
+// ============================================================================
+const canvas = document.getElementById('stage');
+const ctx = canvas.getContext('2d');
+
+let width = 0, height = 0;
+const renderScale = 0.25; // Escala do Raymarcher para manter 60 FPS com Raytracing em tempo real no JS
+
+function resize() {
+  width = Math.floor(window.innerWidth * renderScale);
+  height = Math.floor(window.innerHeight * renderScale);
+  canvas.width = width;
+  canvas.height = height;
+}
+window.addEventListener('resize', resize);
+resize();
+
+const keys = {};
+window.addEventListener('keydown', e => keys[e.code] = true);
+window.addEventListener('keyup', e => keys[e.code] = false);
+
+// Físicas: CCD e Colisão de Esfera x Paredes
+function updatePhysics(dt) {
+  // Teclas e Força Aplicada
+  const fDrive = 150.0;
+  let force = new Vec3();
+  const forward = new Vec3(Math.cos(player.rotY), 0, Math.sin(player.rotY));
+  const right = new Vec3(-Math.sin(player.rotY), 0, Math.cos(player.rotY));
+
+  if (keys['KeyW'] || keys['ArrowUp']) force = force.add(forward.scale(fDrive));
+  if (keys['KeyS'] || keys['ArrowDown']) force = force.sub(forward.scale(fDrive));
+  if (keys['KeyA'] || keys['ArrowLeft']) player.rotY -= 2.0 * dt;
+  if (keys['KeyD'] || keys['ArrowRight']) player.rotY += 2.0 * dt;
+
+  // Respirador/Partículas do Movimento
+  if (force.lengthSq() > 0 && Math.random() < 0.3) {
+    const pPos = player.pos.add(new Vec3((Math.random()-0.5)*0.2, -0.2, (Math.random()-0.5)*0.2));
+    const pVel = player.vel.scale(-0.2).add(new Vec3((Math.random()-0.5)*0.5, 0.5, (Math.random()-0.5)*0.5));
+    particles.push(new Particle(pPos, pVel, 0.8, [0, 255, 204]));
+  }
+
+  // Resistencia do Ar: Fd = 0.5 * rho * v^2 * Cd * A
+  const vLen = player.vel.length();
+  let fDrag = new Vec3();
+  if (vLen > 0.0001) {
+    const fdMag = 0.5 * PHYS.rho * vLen * vLen * PHYS.Cd * PHYS.A;
+    fDrag = player.vel.normalize().scale(-fdMag);
+    document.getElementById('fd').innerText = fdMag.toFixed(3);
+  } else {
+    document.getElementById('fd').innerText = "0.000";
+  }
+
+  // Atrito com o Chão
+  const normalForce = player.mass * PHYS.g;
+  let fFriction = new Vec3();
+  if (vLen > 0.0001) {
+    fFriction = player.vel.normalize().scale(-PHYS.mu_d * normalForce);
+  }
+
+  // Aceleração total (F = m * a)
+  const totalForce = force.add(fDrag).add(fFriction);
+  const accel = totalForce.scale(1 / player.mass);
+
+  // Integração de Euler Modificada
+  player.vel = player.vel.add(accel.scale(dt));
+
+  // CCD (Continuous Collision Detection) via Sub-stepping
+  const steps = 8;
+  const subDt = dt / steps;
+  for (let s = 0; s < steps; s++) {
+    player.pos = player.pos.add(player.vel.scale(subDt));
+    
+    // Distância atual até o obstáculo mais próximo
+    const dist = mapSDF(player.pos);
+    if (dist < player.radius) {
+      // Colisão Detectada: Calcular Normal de Impacto
+      const N = calcNormal(player.pos);
+      // Posição de Correção
+      const overlap = player.radius - dist;
+      player.pos = player.pos.add(N.scale(overlap));
+
+      // Resolução de Impulso com Restituição
+      const vDotN = player.vel.dot(N);
+      if (vDotN < 0) {
+        const impulse = N.scale(-(1 + PHYS.restitution) * vDotN);
+        player.vel = player.vel.add(impulse);
+
+        // Faíscas/Partículas na Colisão
+        for (let i = 0; i < 5; i++) {
+          const sparkVel = N.scale(2.0).add(new Vec3((Math.random()-0.5)*2, Math.random()*2, (Math.random()-0.5)*2));
+          particles.push(new Particle(player.pos.clone ? player.pos.clone() : new Vec3(player.pos.x, player.pos.y, player.pos.z), sparkVel, 0.4, [255, 200, 50]));
+        }
+      }
+    }
+  }
+
+  // Atualiza Partículas
+  for (let i = particles.length - 1; i >= 0; i--) {
+    particles[i].update(dt);
+    if (particles[i].life <= 0) particles.splice(i, 1);
+  }
+
+  document.getElementById('vel').innerText = player.vel.length().toFixed(2);
+  document.getElementById('parts').innerText = particles.length;
+}
+
+// Raymarching Pixel Buffer
+function render() {
+  const imgData = ctx.createImageData(width, height);
+  const data = imgData.data;
+
+  const fov = 1.0;
+  const aspect = width / height;
+
+  const lightPos = player.pos.add(new Vec3(0, 0.2, 0)); // Luz de Lanterna / Tocha do Jogador
+
+  // Vetores de Orientação do Raymarching
+  const cosY = Math.cos(player.rotY);
+  const sinY = Math.sin(player.rotY);
+  const camDir = new Vec3(cosY, 0, sinY);
+  const camRight = new Vec3(-sinY, 0, cosY);
+  const camUp = new Vec3(0, 1, 0);
+
+  for (let y = 0; y < height; y++) {
+    const py = (1.0 - (2.0 * y / height)) * fov / aspect;
+    for (let x = 0; x < width; x++) {
+      const px = ((2.0 * x / width) - 1.0) * fov;
+
+      // Direção do Raio
+      const rd = camDir.add(camRight.scale(px)).add(camUp.scale(py)).normalize();
+      const ro = player.pos;
+
+      // Raymarching Loop
+      let t = 0.01;
+      let hit = false;
+      let p = new Vec3();
+
+      for (let step = 0; step < 40; step++) {
+        p = ro.add(rd.scale(t));
+        const d = mapSDF(p);
+        if (d < 0.002) { hit = true; break; }
+        t += d;
+        if (t > 10.0) break;
+      }
+
+      const pixelIdx = (y * width + x) * 4;
+
+      if (hit) {
+        const N = calcNormal(p);
+        const L = lightPos.sub(p);
+        const lightDist = L.length();
+        const Lnorm = L.normalize();
+
+        // 1. Lei do Quadrado Inverso (Decaimento da Luz)
+        const attenuation = 1.0 / (1.0 + 0.5 * lightDist + 0.8 * lightDist * lightDist);
+
+        // 2. Difusa Lambertiana
+        const diff = Math.max(0.0, N.dot(Lnorm));
+
+        // 3. Sombras Suaves (Soft Shadows)
+        const shadow = softShadow(p.add(N.scale(0.01)), Lnorm, 0.02, lightDist, 8.0);
+
+        // 4. Oclusão Ambiental Simulada (AO)
+        const ao = calcAO(p, N);
+
+        // Cálculo da Cor Final
+        const baseColor = (Math.sin(p.x * 4) * Math.sin(p.z * 4) > 0) ? [180, 180, 200] : [100, 110, 130];
+        const finalLight = (diff * shadow * attenuation) + (0.05 * ao);
+
+        data[pixelIdx]     = Math.min(255, baseColor[0] * finalLight * ao);
+        data[pixelIdx + 1] = Math.min(255, baseColor[1] * finalLight * ao);
+        data[pixelIdx + 2] = Math.min(255, baseColor[2] * finalLight * ao);
+        data[pixelIdx + 3] = 255;
+      } else {
+        // Céu / Abismo
+        data[pixelIdx]     = 5;
+        data[pixelIdx + 1] = 5;
+        data[pixelIdx + 2] = 12;
+        data[pixelIdx + 3] = 255;
+      }
+    }
+  }
+
+  ctx.putImageData(imgData, 0, 0);
+
+  // Renderização 2D Overlay de Partículas na Resolução da Tela
+  for (let pt of particles) {
+    const relPos = pt.pos.sub(player.pos);
+    const dist = relPos.length();
+    if (dist < 0.1) continue;
+
+    // Projeção simples de Partícula 3D -> 2D
+    const dotFwd = relPos.dot(camDir);
+    if (dotFwd > 0.1) {
+      const dotRgt = relPos.dot(camRight);
+      const dotUp  = relPos.dot(camUp);
+
+      const screenX = (width / 2) + (dotRgt / dotFwd) * (width / fov);
+      const screenY = (height / 2) - (dotUp / dotFwd) * (height * aspect / fov);
+
+      const alpha = Math.max(0, pt.life / pt.maxLife);
+      ctx.fillStyle = `rgba(${pt.color[0]}, ${pt.color[1]}, ${pt.color[2]}, ${alpha})`;
+      ctx.beginPath();
+      ctx.arc(screenX, screenY, Math.max(1, (2.0 / dotFwd)), 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+}
+
+// ============================================================================
+// 6. LOOP PRINCIPAL COM MEDIÇÃO REAL DE FPS
+// ============================================================================
+let lastTime = performance.now();
+let frameCount = 0;
+let fpsTimer = 0;
+
+function frame(now) {
+  const dt = Math.min(0.05, (now - lastTime) / 1000); // Cap de Delta Time
+  lastTime = now;
+
+  frameCount++;
+  fpsTimer += dt;
+  if (fpsTimer >= 1.0) {
+    document.getElementById('fps').innerText = frameCount;
+    frameCount = 0;
+    fpsTimer = 0;
+  }
+
+  updatePhysics(dt);
+  render();
+
+  requestAnimationFrame(frame);
+}
+
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
